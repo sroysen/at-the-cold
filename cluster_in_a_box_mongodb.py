@@ -298,6 +298,8 @@ class mongoSecurity:
         self.password = password
         self.key_file = 'default.shared-key.txt'
         self.key_pass = key_pass
+        # Enable authentication if a username is provided
+        self.authentication_enabled = (self.user != '')
 
     def createKeyFile(self, fullFileName):
         self.key_file = fullFileName
@@ -312,7 +314,7 @@ class mongoSecurity:
             subprocess.call(['chmod', '600', self.key_file])
 
 class mongodbInstance:
-    def __init__(self, parentname, name, data_location, conf_file, pid_file, log_file, mongo_type, ip, port, credentials, auth, journaled, binary):
+    def __init__(self, parentname, name, data_location, conf_file, pid_file, log_file, mongo_type, ip, port, credentials, journaled, binary):
         self.parentname = parentname
         self.name = name
         self.data_location = data_location
@@ -323,7 +325,7 @@ class mongodbInstance:
         self.ip = ip
         self.port = port
         self.credentials = credentials
-        self.auth = auth
+        self.auth = self.credentials.authentication_enabled
         self.journaled = journaled
         #self.status = 'UnKnown'
         self.rest = 'false'
@@ -336,6 +338,7 @@ class mongodbInstance:
         self.options = [binary]
         self.binary = binary
         self.related_mongos = []
+        self.is_configured = False
 
     def create_conf_file(self, init_script):
         subprocess.call(['mkdir', '-p', self.data_location])
@@ -369,13 +372,18 @@ class mongodbInstance:
             fcg.write( prep_value_for_conf("Do not preallocate space for the files in a test environment", "noprealloc", 'true' ) )
             add_option(self.options, 'noprealloc', '')
             fcg.write( prep_value_for_conf("Just for local tests and debugging: remove on real systems", "oplogSize", str(192)))
-            fcg.write( prep_value_for_conf("Enable Authentication on this instance", "auth", 'true' if self.auth else 'false') )
-            add_option(self.options, 'noauth', '')
+            add_option(self.options, 'oplogSize', '192')
+            if self.auth:
+                fcg.write( prep_value_for_conf("Enable Authentication on this instance", "auth", 'true') )
+            else:
+                add_option(self.options, 'noauth', '')
+                fcg.write( prep_value_for_conf("Enable Authentication on this instance", "auth", 'false') )
+
         
         fcg.write( prep_value_for_conf("Full pathname for the pid file", "pidfilepath", self.pid_file) )
         add_option(self.options, 'pidfilepath', self.pid_file)
         fcg.write( prep_value_for_conf("Full pathname for the keyFile to use", "keyFile", self.credentials.key_file) )
-        #add_option(self.options, 'keyFile', '')
+        add_option(self.options, 'keyFile', self.credentials.key_file)
         if self.mongo_type.startswith('replSet'):
             # Get the connection parameters for the other members of the replica set
             fullRepSetCfg = self.parentname+'/' + get_other_members(self.related_mongos) 
@@ -417,11 +425,13 @@ class mongodbInstance:
         pprint.pprint (vars(self))
 
     def add_admin_account(self):
-        self.admin.add_user(self.credentials.user, self.credentials.password, roles = ["userAdminAnyDatabase"] )
+        self.admin.add_user(self.credentials.user, self.credentials.password, roles = ["userAdminAnyDatabase", "dbAdminAnyDatabase", "readWriteAnyDatabase", "clusterAdmin"] )
 
-    def login_admin(self):
-        # if running in authenticated mode, provide a user and a password
-        self.admin.authenticate(self.credentials.user, self.credentials.password)
+    def connect2admin(self):
+        self.admin = self.connection.admin
+        # Authenticate if the instance has already been configured and is not an 'Arbiter' in a rs
+        if self.is_configured and self.mongo_type != 'replSet.Arbiter':
+            self.admin.authenticate(self.credentials.user, self.credentials.password)
 
     def start(self, safe=False, safe_delay=5):
         print "Starting " + self.name 
@@ -471,6 +481,8 @@ class mongodbInstance:
             add_option(options, 'nojournal', '')
             add_option(options, 'noprealloc', '')
             add_option(options, 'noauth', '')
+            # Remove this option for production systems or provide a far more sensitive value
+            add_option(options, 'oplogSize', '192')
         add_option(options, 'logappend', '')
         add_option(options, 'nohttpinterface', '')
         #pdb.set_trace()
@@ -489,12 +501,13 @@ class mongodbInstance:
         print "Configuring "+self.name
         if self.connection == None:
             self.connect()
-        # Add admin user
-        self.add_admin_account()
+        
+        if self.mongo_type == 'configsvr' or mongo_type == 'replSet.Master':
+            # Add admin user
+            self.add_admin_account()
 
-        # Run configuration commands
-        if self.mongo_type == 'replSet.Arbiter':
-            self.admin.command('replSetInitiate')
+        # Flag this instance as already configured
+        self.is_configured = True
 
     def shutdown(self, timeout = 30):
         print "Shutting down "+ self.name
@@ -535,11 +548,11 @@ class mongodbInstance:
             if reconnections_attempts <= 0:
                 logging.critical('Failed to connect to ' + self.name)
             else:
-                self.admin = self.connection.admin
+                self.connect2admin()
         else:
             try:
                 self.connection = pymongo.MongoClient(self.ip, self.port)
-                self.admin = self.connection.admin
+                self.connect2admin()
             except pymongo.errors.ConnectionFailure:
                 logging.critical('Failed to connect to ' + self.name)
 
@@ -567,7 +580,7 @@ class mongodbInstance:
         if verbose:
             printplus(self.mongo_status)
 
-    def status(self):
+    def status(self, status_requested='full'):
         print '-' * 50
         print self.name + ': ' + self.mongo_type
         self.connect(2)
@@ -575,14 +588,19 @@ class mongodbInstance:
             print "Not running"
         else:
             mongo_status = self.run_command('serverStatus')
-            print 'pplus output'
-            printplus(mongo_status)
-            print 'pprint output'
-            pprint.pprint(mongo_status, indent=4)
+            if status_requested=='full':
+                print 'pplus output'
+                printplus(mongo_status)
+                print 'pprint output'
+                pprint.pprint(mongo_status, indent=4)
+            else:
+                print 'Running'
+
 
     def IsPrimary(self):
         # Returns true if this mongo is the primary node of a replicaset
         #pdb.set_trace() 
+        #print '----- ismaster'
         ismaster = self.run_command('ismaster')
         #printplus(ismaster)
         return(ismaster['ismaster'])
@@ -626,7 +644,6 @@ class mongodbReplicaSet:
                               self.clusterParams.getNextPort(),\
                               self.clusterParams.mongoCredentials,\
                               False,\
-                              False,\
                               self.clusterParams.lbin+'/mongod')
         return(mdb)
 
@@ -653,9 +670,9 @@ class mongodbReplicaSet:
         for mongo in self.mongo_instances:
             mongo.shutdown()
 
-    def status(self):
+    def status(self,status_requested):
         for mongoins in self.mongo_instances:
-            mongoins.status()
+            mongoins.status(status_requested)
 
     def get_member_parms(self, i):
         mongo = self.mongo_instances[i]
@@ -681,8 +698,9 @@ class mongodbReplicaSet:
         for mongo in self.mongo_instances:
             mongo.start('safe')
         # Give them a chance to get up (wait a few seconds)
-        self.mongo_instances
+        #self.mongo_instances
         time.sleep(1)
+
         # Configure all of them
         repSetConfig = { '_id': self.name,
                         'members': self.get_list_of_members()
@@ -692,14 +710,37 @@ class mongodbReplicaSet:
         print 'Waiting one minute or until the replicaset has selfconfigured itself'
         for i in range(1, 60):
             rep_set_status = self.mongo_instances[0].run_command('isMaster')
+            #print "rep_set_status: " 
+            #printplus(rep_set_status)
             if self.mongo_instances[0].check_rep_set_status('IsRepSetConfigured', rep_set_status):
                 print self.mongo_instances[0].parentname + ' is configured'
                 break
             time.sleep(1)
 
+        # Flag all the members as configured, though there is one more piece missing: adding the admin account once
+        # the master of the replicaset has already been established
+        # Run any selfconfiguration options that are requiered (for instance, adding the admin user and enabling authentication
+        #mongo_master = self.getPrimaryNode
+        #master_detected = False
+        for mongo in self.mongo_instances:
+            mongo.is_configured = True
+            #if not master_detected and mongo.IsPrimary():
+            #    mongo.config('replSet.Master')
+            #    master_detected = True
+            #else:
+            #    mongo.config()
+
+        #if not master_detected:
+        #    print "Critical error: master was not detected in this replicaset"
+
+
     def kill(self):
         for mongoins in self.mongo_instances:
             mongoins.kill()
+
+    def add_admin_account(self):
+        mongo_master = self.getPrimaryNode()
+        mongo_master.config('replSet.Master')
 
     def getPrimaryNode(self):
         # Gets the primary node of the replicaset and returns it
@@ -736,7 +777,6 @@ class mongodbConfigSet:
                               self.clusterParams.getNextIP(),\
                               self.clusterParams.getNextPort(),\
                               self.clusterParams.mongoCredentials,\
-                              False,\
                               True,\
                               self.clusterParams.lbin+'/mongod')
         return(mdb)
@@ -759,9 +799,9 @@ class mongodbConfigSet:
         for mongo in self.configMongodbs:
             mongo.stop()
 
-    def status(self):
+    def status(self, status_requested):
         for mongo in self.configMongodbs:
-            mongo.status()
+            mongo.status(status_requested)
 
     def shutdown(self):
         for mongo in self.configMongodbs:
@@ -776,24 +816,11 @@ class mongodbConfigSet:
 
         mongos_process.start(safe=True, safe_delay=15)
 
-        #print 'Waiting 15 seconds or until the cluster has selfconfigured itself'
-        #for i in range(1, 15):
-            #time.sleep(1)
-            #config_status = mongos_process.run_command('serverStatus')
-            #printplus(config_status)
-            #if self.mongo_instances[0].check_rep_set_status('IsRepSetConfigured', rep_set_status):
-            #    print self.mongo_instances[0].parentname + ' is configured'
-            #    break
-            #print '%02d' % i + ' ' + '.'*i
-
-        
         # Configure all of them
         for mongo in self.configMongodbs:
             mongo.config()
 
         # Initiate the mongos process: mongos will need a detail of the shards that it should connect to.
-        #pdb.set_trace() 
-        # Wait ten seconds until the replicasets get a chance to define themselves
         print "Adding the individual shards (repset masters) to the mongos cluster"
         mongodbsPrimary = [shard.getPrimaryNode() for shard in shardNodes]
         #pdb.set_trace()
@@ -829,8 +856,8 @@ class mongodbShard:
     def stop(self):
         self.replicaset.stop()
 
-    def status(self):
-        self.replicaset.status()
+    def status(self, status_requested):
+        self.replicaset.status(status_requested)
 
     def shutdown(self):
         self.replicaset.shutdown()
@@ -844,6 +871,9 @@ class mongodbShard:
     def getPrimaryNode(self):
         # Gets the primary node of the replicaset and returns it
         return(self.replicaset.getPrimaryNode())
+
+    def add_admin_account(self):
+        self.replicaset.add_admin_account()
 
 
 class mongodbCluster:
@@ -875,7 +905,6 @@ class mongodbCluster:
                               socket.inet_ntoa(self.clusterParams.ip),\
                               self.clusterParams.port,\
                               self.clusterParams.mongoCredentials,\
-                              False,\
                               True,\
                               self.clusterParams.lbin+'/mongos')
         mdb.add_related_mongos(self.configClsts.configMongodbs)
@@ -921,16 +950,16 @@ class mongodbCluster:
         self.mongos_process.start()
 
     def stop(self):
+        self.mongos_process.stop()
         self.configClsts.stop()
         for shard in self.shardNodes:
             shard.stop()
-        self.mongos_process.stop()
 
-    def status(self):
-        self.configClsts.status()
+    def status(self, status_requested):
+        self.configClsts.status(status_requested)
         for shard in self.shardNodes:
-            shard.status()
-        self.mongos_process.status()
+            shard.status(status_requested)
+        self.mongos_process.status(status_requested)
 
     def shutdown(self):
         self.configClsts.shutdown()
@@ -943,12 +972,23 @@ class mongodbCluster:
         for shard in self.shardNodes:
             shard.config()
         
+        # Configure the config mongod
         self.configClsts.config(self.mongos_process, self.shardNodes)
+
+        # Finally, configure the mongos instance
+        self.mongos_process.config()
+
+        # The final step once the replicaset had already selfconfigured is to add the admin account in the master of each one
+        for shard in self.shardNodes:
+            shard.add_admin_account()
+ 
+
 
         # This was a configuration run only, stop the services
         self.shutdown()
 
         self.is_configured = True
+        #pdb.set_trace()
         self.saveCluster()
 
     def kill(self):
@@ -969,7 +1009,7 @@ def parse_options():
     parser.add_option("-k", "--key-phrase", dest="keyphrase", default="abc1234XYZ987", help="Shared secret key for all the mongos")
     parser.add_option("-P", "--port", dest="port", type="int", default=27017, help="Base port to use (default: 27017)")
     parser.add_option("-q", "--port-increments", dest="port_inc", type="int", default=1, help="Port increments to use from one local mongo to the next")
-    parser.add_option("-I", "--ip", dest="base_ip", default="127.0.0.1", help="Base IP to use to bind the mongos")
+    parser.add_option("-I", "--ip", dest="base_ip", default="127.0.0.1", help="Base IP to use to bind the mongo instances: the lowest goes to mongos")
     parser.add_option("-i", "--ip-increments", dest="ip_inc", type="int", default=0, help="IP increments to use from one IP based mongo to the next")
     #parser.add_option("-M", "--mongo-version", dest="mongo_version", default="mongodb-linux-x86_64-2.4.1", help="Mongo version to use")
     parser.add_option("-M", "--mongo-version", dest="mongo_version", default="", help="Mongo version to use")
@@ -1037,7 +1077,10 @@ def main():
         pdb.set_trace() 
     elif action == 'status':
         print '----- status'
-        globalCluster.status()
+        globalCluster.status('simple')
+    elif action == 'fullstatus':
+        print '----- fullstatus'
+        globalCluster.status('full')
     else:
         print 'Unknown action'
 
