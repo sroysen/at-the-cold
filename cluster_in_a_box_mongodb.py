@@ -375,9 +375,12 @@ class mongodbInstance:
             add_option(self.options, 'oplogSize', '192')
             if self.auth:
                 fcg.write( prep_value_for_conf("Enable Authentication on this instance", "auth", 'true') )
+                fcg.write( prep_value_for_conf("Enable Authentication on this instance (32 bits)", "noauth", 'false') )
+                add_option(self.options, 'auth', '')
             else:
                 add_option(self.options, 'noauth', '')
-                fcg.write( prep_value_for_conf("Enable Authentication on this instance", "auth", 'false') )
+                fcg.write( prep_value_for_conf("Disable Authentication on this instance", "auth", 'false') )
+                fcg.write( prep_value_for_conf("Disable Authentication on this instance (32 bits)", "noauth", 'true') )
 
         
         fcg.write( prep_value_for_conf("Full pathname for the pid file", "pidfilepath", self.pid_file) )
@@ -425,12 +428,13 @@ class mongodbInstance:
         pprint.pprint (vars(self))
 
     def add_admin_account(self):
-        self.admin.add_user(self.credentials.user, self.credentials.password, roles = ["userAdminAnyDatabase", "dbAdminAnyDatabase", "readWriteAnyDatabase", "clusterAdmin"] )
+        if self.auth:
+            self.admin.add_user(self.credentials.user, self.credentials.password, roles = ["userAdminAnyDatabase", "dbAdminAnyDatabase", "readWriteAnyDatabase", "clusterAdmin"] )
 
     def connect2admin(self):
         self.admin = self.connection.admin
         # Authenticate if the instance has already been configured and is not an 'Arbiter' in a rs
-        if self.is_configured and self.mongo_type != 'replSet.Arbiter':
+        if self.is_configured and self.mongo_type != 'replSet.Arbiter' and self.auth:
             self.admin.authenticate(self.credentials.user, self.credentials.password)
 
     def start(self, safe=False, safe_delay=5):
@@ -981,8 +985,6 @@ class mongodbCluster:
         # The final step once the replicaset had already selfconfigured is to add the admin account in the master of each one
         for shard in self.shardNodes:
             shard.add_admin_account()
- 
-
 
         # This was a configuration run only, stop the services
         self.shutdown()
@@ -1004,8 +1006,8 @@ class mongodbCluster:
 
 def parse_options():
     parser = OptionParser(usage="Usage: %prog [options] action (create|start|stop)")
-    parser.add_option("-u", "--user", dest="mongo_user", default="local_user", help="Mongodb user")
-    parser.add_option("-p", "--password", dest="password", default="1234abc", help="Mongodb password")
+    parser.add_option("-u", "--user", dest="mongo_user", default="", help="Mongodb user")
+    parser.add_option("-p", "--password", dest="password", default="", help="Mongodb password")
     parser.add_option("-k", "--key-phrase", dest="keyphrase", default="abc1234XYZ987", help="Shared secret key for all the mongos")
     parser.add_option("-P", "--port", dest="port", type="int", default=27017, help="Base port to use (default: 27017)")
     parser.add_option("-q", "--port-increments", dest="port_inc", type="int", default=1, help="Port increments to use from one local mongo to the next")
